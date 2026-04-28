@@ -1,7 +1,7 @@
 import ccxt
 from datetime import datetime
 
-print("🚀 ArbiMine Scanner Running!")
+print("ArbiMine Scanner Running!")
 print(f"Scanning at {datetime.now()}\n")
 
 ex = ccxt.binance()
