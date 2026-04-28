@@ -1,31 +1,33 @@
 import ccxt
-import time
+import csv
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-print("🚀 ARBIMINE REALISTIC SCANNER STARTED")
-print(f"⏰ Time: {datetime.now()}")
-print("🌍 Scanning real USDT spot markets only\n")
+start_time = datetime.now()
 
-# -----------------------------
-# EXCHANGES (stable ones only)
-# -----------------------------
+print("🚀 ARBIMINE ULTIMATE - PRODUCTION REALISTIC SCANNER")
+print(f"⏰ Scan Time: {start_time}")
+print("📊 REAL market arbitrage only (no fake spikes)\n")
+
 exchange_ids = [
     'kucoin', 'okx', 'gateio', 'mexc', 'bitmart',
     'htx', 'bitfinex', 'bitstamp', 'phemex', 'coinex',
     'poloniex', 'lbank', 'ascendex', 'bitrue', 'whitebit'
 ]
 
-# -----------------------------
-# SETTINGS (REALISTIC)
-# -----------------------------
+# =========================
+# REALISTIC SETTINGS
+# =========================
 MIN_PROFIT = 0.3
 MAX_PROFIT = 10.0
-MIN_VOLUME = 200000
-MIN_PRICE = 0.00001
+MIN_VOLUME = 50000
 MAX_THREADS = 10
+MAX_SPREAD = 3.0
 
-BAD_WORDS = ['UP/', 'DOWN/', 'BULL/', 'BEAR/', '3L/', '3S/']
+BAD_WORDS = [
+    'UP/', 'DOWN/', 'BULL/', 'BEAR/', '3L/', '3S/',
+    'ELON','TROLL','MAGA','BOBO','HOLD','MOG','DOG','SHIB'
+]
 
 EXCHANGE_FEES = {
     "kucoin": 0.20, "okx": 0.16, "gateio": 0.20, "mexc": 0.20,
@@ -37,9 +39,9 @@ EXCHANGE_FEES = {
 market_data = {}
 results = []
 
-# -----------------------------
-# SCAN FUNCTION
-# -----------------------------
+# =========================
+# SCAN EXCHANGE
+# =========================
 def scan_exchange(ex_id):
     try:
         ex = getattr(ccxt, ex_id)({
@@ -54,16 +56,17 @@ def scan_exchange(ex_id):
         markets = ex.load_markets()
         tickers = ex.fetch_tickers()
 
-        data = {}
+        output = {}
 
         for symbol, t in tickers.items():
 
-            symbol = symbol.split(":")[0]
+            # FIX: no split() corruption
+            symbol = symbol.replace(":USDT", "")
 
             if not symbol.endswith("/USDT"):
                 continue
 
-            if any(bad in symbol for bad in BAD_WORDS):
+            if any(b in symbol.upper() for b in BAD_WORDS):
                 continue
 
             if symbol not in markets:
@@ -71,38 +74,42 @@ def scan_exchange(ex_id):
 
             bid = t.get("bid")
             ask = t.get("ask")
-            vol = t.get("quoteVolume") or t.get("baseVolume") or 0
+            vol = t.get("quoteVolume") or 0
 
-            # -----------------------------
-            # REAL DATA FILTERS
-            # -----------------------------
-            if not bid or not ask or bid <= 0 or ask <= 0:
+            # REAL MARKET VALIDATION
+            if not bid or not ask:
                 continue
 
-            if ask < MIN_PRICE:
+            if bid <= 0 or ask <= 0:
+                continue
+
+            if ask <= bid:
+                continue
+
+            spread = ((ask - bid) / ask) * 100
+            if spread > MAX_SPREAD:
                 continue
 
             if vol < MIN_VOLUME:
                 continue
 
-            data[symbol] = {
+            output[symbol] = {
                 "exchange": ex_id,
                 "bid": bid,
                 "ask": ask,
                 "volume": vol
             }
 
-        print(f"✓ {ex_id.upper()} | {len(data)} pairs")
-        return ex_id, data, True
+        print(f"✓ {ex_id.upper()} | {len(output)} pairs")
+        return ex_id, output, True
 
-    except Exception as e:
-        print(f"✗ {ex_id.upper()} failed")
+    except:
         return ex_id, {}, False
 
 
-# -----------------------------
-# MULTI THREAD SCAN
-# -----------------------------
+# =========================
+# PARALLEL SCAN
+# =========================
 with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
     futures = [executor.submit(scan_exchange, e) for e in exchange_ids]
 
@@ -112,9 +119,10 @@ with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
         for sym, info in data.items():
             market_data.setdefault(sym, []).append(info)
 
-# -----------------------------
-# ANALYSIS ENGINE
-# -----------------------------
+
+# =========================
+# ARBITRAGE ENGINE
+# =========================
 print("\n🔍 ANALYZING REAL ARBITRAGE...\n")
 
 for symbol, listings in market_data.items():
@@ -128,24 +136,23 @@ for symbol, listings in market_data.items():
             if buy["exchange"] == sell["exchange"]:
                 continue
 
-            if buy["ask"] <= 0:
+            if sell["bid"] <= buy["ask"]:
                 continue
 
             gross = ((sell["bid"] - buy["ask"]) / buy["ask"]) * 100
 
-            fee = EXCHANGE_FEES.get(buy["exchange"], 0.25) + \
-                  EXCHANGE_FEES.get(sell["exchange"], 0.25)
+            fee = (
+                EXCHANGE_FEES.get(buy["exchange"], 0.25) +
+                EXCHANGE_FEES.get(sell["exchange"], 0.25)
+            )
 
             net = gross - fee
 
-            # -----------------------------
-            # STRICT REALISTIC FILTER
-            # -----------------------------
+            volume = min(buy["volume"], sell["volume"])
+
             if (
                 MIN_PROFIT <= net <= MAX_PROFIT and
-                gross <= 10.0 and
-                buy["volume"] > MIN_VOLUME and
-                sell["volume"] > MIN_VOLUME
+                volume >= MIN_VOLUME
             ):
                 results.append({
                     "symbol": symbol,
@@ -154,34 +161,63 @@ for symbol, listings in market_data.items():
                     "buy_price": buy["ask"],
                     "sell_price": sell["bid"],
                     "profit": round(net, 2),
-                    "volume": min(buy["volume"], sell["volume"])
+                    "volume": int(volume)
                 })
 
-# -----------------------------
-# SORT RESULTS
-# -----------------------------
+
+# =========================
+# SORT + CLEAN
+# =========================
 results.sort(key=lambda x: x["profit"], reverse=True)
 
-# -----------------------------
+unique = []
+seen = set()
+
+for r in results:
+    key = (r["symbol"], r["buy"], r["sell"])
+    if key not in seen:
+        seen.add(key)
+        unique.append(r)
+
+
+# =========================
 # OUTPUT
-# -----------------------------
-print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+# =========================
+print("=" * 70)
 print(f"🪙 Coins scanned: {len(market_data)}")
-print(f"💎 Opportunities: {len(results)}")
-print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
+print(f"💎 Real opportunities: {len(unique)}")
+print("=" * 70)
 
-if results:
-    print("🔥 TOP REAL ARBITRAGE OPPORTUNITIES:\n")
+if unique:
+    print("\n🔥 REAL ARBITRAGE OPPORTUNITIES:\n")
 
-    for i, r in enumerate(results[:50], 1):
+    for i, r in enumerate(unique[:50], 1):
         print(
             f"{i}. {r['symbol']} | "
-            f"BUY {r['buy']} @ {r['buy_price']:.8f} | "
-            f"SELL {r['sell']} @ {r['sell_price']:.8f} | "
+            f"BUY {r['buy']} @ {r['buy_price']:.6f} | "
+            f"SELL {r['sell']} @ {r['sell_price']:.6f} | "
             f"NET {r['profit']}% | "
-            f"VOL {r['volume']:.0f}"
+            f"VOL {r['volume']:,}"
         )
 else:
-    print("❌ No real arbitrage opportunities found.")
+    print("❌ No real arbitrage opportunities right now")
 
-print("\n🔥 ARBIMINE REALISTIC COMPLETE")
+# =========================
+# CSV EXPORT
+# =========================
+try:
+    with open("arbimine_results.csv", "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=["symbol","buy","buy_price","sell","sell_price","profit","volume"]
+        )
+        writer.writeheader()
+        writer.writerows(unique)
+
+    print("\n📁 Saved: arbimine_results.csv")
+
+except Exception as e:
+    print(f"\n❌ CSV error: {e}")
+
+print(f"\n⚡ Finished in: {datetime.now() - start_time}")
+print("🔥 ARBIMINE PRODUCTION COMPLETE")
