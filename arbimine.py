@@ -1,61 +1,68 @@
 import ccxt
-import threading
-import time
+import csv
 from datetime import datetime
-from flask import Flask, jsonify, render_template_string
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# =========================
-# CONFIG
-# =========================
+start_time = datetime.now()
 
-EXCHANGES = [
+print("🚀 ARBIMINE ULTIMATE - PRODUCTION REALISTIC SCANNER")
+print(f"⏰ Scan Time: {start_time}")
+print("📊 REAL market arbitrage only (no fake spikes)\n")
+
+exchange_ids = [
     'kucoin', 'okx', 'gateio', 'mexc', 'bitmart',
-    'htx', 'bitfinex', 'bitstamp', 'phemex',
-    'coinex', 'poloniex', 'lbank', 'ascendex',
-    'bitrue', 'whitebit'
+    'htx', 'bitfinex', 'bitstamp', 'phemex', 'coinex',
+    'poloniex', 'lbank', 'ascendex', 'bitrue', 'whitebit'
 ]
 
-MIN_PROFIT = 1.0        # realistic minimum
-MAX_PROFIT = 10.0       # cap unrealistic spikes
+# =========================
+# REALISTIC SETTINGS
+# =========================
+MIN_PROFIT = 0.3
+MAX_PROFIT = 10.0
 MIN_VOLUME = 50000
-MAX_SYMBOLS = 400
-
-FEE = 0.25              # avg trading fee %
-WITHDRAWAL_COST = 0.30  # network + withdrawal estimate
-SLIPPAGE = 0.40
+MAX_THREADS = 10
+MAX_SPREAD = 3.0
 
 BAD_WORDS = [
-    'UP/', 'DOWN/', 'BULL', 'BEAR', '3L', '3S',
-    'ELON', 'MAGA', 'DOGE', 'SHIB', 'PEPE'
+    'UP/', 'DOWN/', 'BULL/', 'BEAR/', '3L/', '3S/',
+    'ELON','TROLL','MAGA','BOBO','HOLD','MOG','DOG','SHIB'
 ]
 
-# =========================
-# GLOBAL STORAGE
-# =========================
+EXCHANGE_FEES = {
+    "kucoin": 0.20, "okx": 0.16, "gateio": 0.20, "mexc": 0.20,
+    "bitmart": 0.25, "htx": 0.20, "bitfinex": 0.20, "bitstamp": 0.25,
+    "phemex": 0.20, "coinex": 0.20, "poloniex": 0.25,
+    "lbank": 0.20, "ascendex": 0.20, "bitrue": 0.20, "whitebit": 0.20
+}
 
 market_data = {}
-opportunities = []
+results = []
 
 # =========================
-# EXCHANGE SCANNER
+# SCAN EXCHANGE
 # =========================
-
-def scan_exchange(name):
+def scan_exchange(ex_id):
     try:
-        if not hasattr(ccxt, name):
-            return
-
-        ex = getattr(ccxt, name)({
+        ex = getattr(ccxt, ex_id)({
             "enableRateLimit": True,
-            "timeout": 20000
+            "timeout": 30000,
+            "options": {"defaultType": "spot"}
         })
+
+        if not ex.has.get("fetchTickers"):
+            return ex_id, {}, False
 
         markets = ex.load_markets()
         tickers = ex.fetch_tickers()
 
-        results = {}
+        output = {}
 
         for symbol, t in tickers.items():
+
+            # FIX: no split() corruption
+            symbol = symbol.replace(":USDT", "")
+
             if not symbol.endswith("/USDT"):
                 continue
 
@@ -69,176 +76,148 @@ def scan_exchange(name):
             ask = t.get("ask")
             vol = t.get("quoteVolume") or 0
 
-            if not bid or not ask or ask <= 0:
+            # REAL MARKET VALIDATION
+            if not bid or not ask:
                 continue
 
-            if vol < 10000:
+            if bid <= 0 or ask <= 0:
                 continue
 
-            results[symbol] = {
-                "exchange": name,
+            if ask <= bid:
+                continue
+
+            spread = ((ask - bid) / ask) * 100
+            if spread > MAX_SPREAD:
+                continue
+
+            if vol < MIN_VOLUME:
+                continue
+
+            output[symbol] = {
+                "exchange": ex_id,
                 "bid": bid,
                 "ask": ask,
                 "volume": vol
             }
 
-        market_data[name] = results
-        print(f"✓ {name} loaded {len(results)} pairs")
+        print(f"✓ {ex_id.upper()} | {len(output)} pairs")
+        return ex_id, output, True
 
-    except Exception as e:
-        print(f"✗ {name} error")
+    except:
+        return ex_id, {}, False
 
 
 # =========================
-# ANALYSIS ENGINE (REALISTIC)
+# PARALLEL SCAN
 # =========================
+with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
+    futures = [executor.submit(scan_exchange, e) for e in exchange_ids]
 
-def analyze():
-    global opportunities
-    opportunities = []
+    for f in as_completed(futures):
+        ex_id, data, ok = f.result()
 
-    all_symbols = {}
+        for sym, info in data.items():
+            market_data.setdefault(sym, []).append(info)
 
-    # merge all exchange data
-    for ex, data in market_data.items():
-        for sym, val in data.items():
-            all_symbols.setdefault(sym, []).append(val)
 
-    for sym, listings in all_symbols.items():
-        if len(listings) < 2:
-            continue
+# =========================
+# ARBITRAGE ENGINE
+# =========================
+print("\n🔍 ANALYZING REAL ARBITRAGE...\n")
 
-        for buy in listings:
-            for sell in listings:
+for symbol, listings in market_data.items():
 
-                if buy["exchange"] == sell["exchange"]:
-                    continue
+    if len(listings) < 2:
+        continue
 
-                buy_price = buy["ask"]
-                sell_price = sell["bid"]
+    for buy in listings:
+        for sell in listings:
 
-                if buy_price <= 0:
-                    continue
+            if buy["exchange"] == sell["exchange"]:
+                continue
 
-                gross = ((sell_price - buy_price) / buy_price) * 100
+            if sell["bid"] <= buy["ask"]:
+                continue
 
-                net = gross - FEE - FEE - WITHDRAWAL_COST - SLIPPAGE
+            gross = ((sell["bid"] - buy["ask"]) / buy["ask"]) * 100
 
-                if net < MIN_PROFIT or net > MAX_PROFIT:
-                    continue
+            fee = (
+                EXCHANGE_FEES.get(buy["exchange"], 0.25) +
+                EXCHANGE_FEES.get(sell["exchange"], 0.25)
+            )
 
-                volume = min(buy["volume"], sell["volume"])
+            net = gross - fee
 
-                if volume < MIN_VOLUME:
-                    continue
+            volume = min(buy["volume"], sell["volume"])
 
-                # AI-like scoring (simple realism model)
-                score = net * (volume / 100000)
-
-                opportunities.append({
-                    "symbol": sym,
+            if (
+                MIN_PROFIT <= net <= MAX_PROFIT and
+                volume >= MIN_VOLUME
+            ):
+                results.append({
+                    "symbol": symbol,
                     "buy": buy["exchange"],
                     "sell": sell["exchange"],
-                    "buy_price": round(buy_price, 8),
-                    "sell_price": round(sell_price, 8),
+                    "buy_price": buy["ask"],
+                    "sell_price": sell["bid"],
                     "profit": round(net, 2),
-                    "volume": round(volume, 0),
-                    "score": round(score, 2)
+                    "volume": int(volume)
                 })
 
-    opportunities.sort(key=lambda x: x["score"], reverse=True)
+
+# =========================
+# SORT + CLEAN
+# =========================
+results.sort(key=lambda x: x["profit"], reverse=True)
+
+unique = []
+seen = set()
+
+for r in results:
+    key = (r["symbol"], r["buy"], r["sell"])
+    if key not in seen:
+        seen.add(key)
+        unique.append(r)
 
 
 # =========================
-# BACKGROUND LOOP
+# OUTPUT
 # =========================
+print("=" * 70)
+print(f"🪙 Coins scanned: {len(market_data)}")
+print(f"💎 Real opportunities: {len(unique)}")
+print("=" * 70)
 
-def worker():
-    while True:
-        print("\n🚀 Scanning market...")
+if unique:
+    print("\n🔥 REAL ARBITRAGE OPPORTUNITIES:\n")
 
-        threads = []
-        for ex in EXCHANGES:
-            t = threading.Thread(target=scan_exchange, args=(ex,))
-            t.start()
-            threads.append(t)
-
-        for t in threads:
-            t.join()
-
-        print("🔍 Analyzing opportunities...")
-        analyze()
-
-        print(f"💎 Found: {len(opportunities)} opportunities")
-
-        time.sleep(15)  # refresh every 15 sec
-
+    for i, r in enumerate(unique[:50], 1):
+        print(
+            f"{i}. {r['symbol']} | "
+            f"BUY {r['buy']} @ {r['buy_price']:.6f} | "
+            f"SELL {r['sell']} @ {r['sell_price']:.6f} | "
+            f"NET {r['profit']}% | "
+            f"VOL {r['volume']:,}"
+        )
+else:
+    print("❌ No real arbitrage opportunities right now")
 
 # =========================
-# FLASK DASHBOARD
+# CSV EXPORT
 # =========================
+try:
+    with open("arbimine_results.csv", "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=["symbol","buy","buy_price","sell","sell_price","profit","volume"]
+        )
+        writer.writeheader()
+        writer.writerows(unique)
 
-app = Flask(__name__)
+    print("\n📁 Saved: arbimine_results.csv")
 
-HTML = """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>ArbiMine Pro Dashboard</title>
-    <meta http-equiv="refresh" content="5">
-    <style>
-        body { font-family: Arial; background:#0f172a; color:white; padding:20px; }
-        table { width:100%; border-collapse: collapse; }
-        th, td { padding:10px; border-bottom:1px solid #333; }
-        th { background:#1e293b; }
-        .good { color:#00ff88; }
-    </style>
-</head>
-<body>
-    <h2>🚀 ARBIMINE PRO LIVE DASHBOARD</h2>
-    <p>Real-time Arbitrage Scanner (Max 10% Profit Filter)</p>
+except Exception as e:
+    print(f"\n❌ CSV error: {e}")
 
-    <table>
-        <tr>
-            <th>Symbol</th>
-            <th>Buy</th>
-            <th>Sell</th>
-            <th>Profit %</th>
-            <th>Volume</th>
-            <th>Score</th>
-        </tr>
-
-        {% for o in data %}
-        <tr>
-            <td>{{o.symbol}}</td>
-            <td>{{o.buy}} @ {{o.buy_price}}</td>
-            <td>{{o.sell}} @ {{o.sell_price}}</td>
-            <td class="good">{{o.profit}}%</td>
-            <td>{{o.volume}}</td>
-            <td>{{o.score}}</td>
-        </tr>
-        {% endfor %}
-    </table>
-</body>
-</html>
-"""
-
-
-@app.route("/")
-def home():
-    return render_template_string(HTML, data=opportunities[:50])
-
-
-@app.route("/api")
-def api():
-    return jsonify(opportunities[:50])
-
-
-# =========================
-# START SYSTEM
-# =========================
-
-if __name__ == "__main__":
-    print("🚀 ARBIMINE PRO v3 STARTING...")
-    threading.Thread(target=worker, daemon=True).start()
-    app.run(host="0.0.0.0", port=5000)
+print(f"\n⚡ Finished in: {datetime.now() - start_time}")
+print("🔥 ARBIMINE PRODUCTION COMPLETE")
